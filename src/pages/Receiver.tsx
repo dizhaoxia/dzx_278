@@ -20,6 +20,9 @@ export default function Receiver() {
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.srcObject = remoteStream;
+      if (remoteStream) {
+        videoRef.current.play().catch(() => {});
+      }
     }
   }, [remoteStream]);
 

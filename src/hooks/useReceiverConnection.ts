@@ -37,6 +37,7 @@ export function useReceiverConnection() {
   const prevBytes = useRef(0);
   const prevTs = useRef(0);
   const pendingCandidates = useRef<RTCIceCandidateInit[]>([]);
+  const pcStateRef = useRef<RTCPeerConnectionState>("new");
 
   const sendAnswer = useSignalStore((s) => s.sendAnswer);
   const sendCandidate = useSignalStore((s) => s.sendCandidate);
@@ -78,10 +79,12 @@ export function useReceiverConnection() {
     pc.onicecandidate = (e) => {
       if (e.candidate) sendCandidate(e.candidate.toJSON());
     };
-    pc.onconnectionstatechange = () => setPcState(pc.connectionState);
+    pc.onconnectionstatechange = () => {
+      pcStateRef.current = pc.connectionState;
+      setPcState(pc.connectionState);
+    };
     pc.oniceconnectionstatechange = () => setIceState(pc.iceConnectionState);
 
-    // Prefer VP8/H264 on the receiving transceiver too.
     pc.ontrack = (e) => {
       const stream = e.streams[0] ?? new MediaStream([e.track]);
       setRemoteStream(stream);
@@ -128,7 +131,7 @@ export function useReceiverConnection() {
 
     stopStats();
     statsTimer.current = setInterval(async () => {
-      if (!pcRef.current || pcState !== "connected") return;
+      if (!pcRef.current || pcStateRef.current !== "connected") return;
       const { stats: next, bytes, ts } = await readLinkStats(
         pcRef.current,
         "receiver",

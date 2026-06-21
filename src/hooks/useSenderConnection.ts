@@ -125,7 +125,7 @@ export function useSenderConnection() {
     if (peers.length > 0 && streamRef.current && !pcRef.current) {
       void startNegotiation();
     }
-  }, [peers, startNegotiation]);
+  }, [peers, localStream, startNegotiation]);
 
   // Register signaling handlers for the answer + ICE from the receiver.
   useEffect(() => {

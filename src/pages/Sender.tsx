@@ -31,6 +31,7 @@ export default function Sender() {
   useEffect(() => {
     if (videoRef.current && localStream) {
       videoRef.current.srcObject = localStream;
+      videoRef.current.play().catch(() => {});
     }
   }, [localStream]);
 

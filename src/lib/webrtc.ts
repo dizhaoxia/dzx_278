@@ -51,12 +51,11 @@ export function applyCodecPreference(sender: RTCRtpSender): void {
 
 /** Apply codec preference to the receiver's transceivers (call before createAnswer). */
 export function applyReceiverCodecPreferences(pc: RTCPeerConnection): void {
-  const caps = RTCRtpReceiver.getCapabilities?.("video")
-  const preferred = caps?.codecs ?? []
+  const preferred = getPreferredCodecs()
   if (!preferred.length) return
   for (const t of pc.getTransceivers()) {
     try {
-      t.setCodecPreferences(preferred)
+      t.setCodecPreferences(preferred as RTCRtpCodec[])
     } catch {
       /* receiver codec preference may be unsupported — ignore */
     }
