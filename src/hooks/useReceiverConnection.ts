@@ -1,0 +1,158 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useSignalStore } from "@/store/useSignalStore";
+import {
+  applyReceiverCodecPreferences,
+  createPeerConnection,
+  pcStateLabel,
+  iceStateLabel,
+  readLinkStats,
+  type LinkStats,
+} from "@/lib/webrtc";
+
+const EMPTY_STATS: LinkStats = {
+  bitrateKbps: 0,
+  width: 0,
+  height: 0,
+  fps: 0,
+  codec: "—",
+  packetsLost: 0,
+  jitterMs: 0,
+  candidateType: "—",
+};
+
+/**
+ * B端 (receiver) WebRTC lifecycle: create the RTCPeerConnection lazily when
+ * the offer arrives, set the remote description, answer, and bind the
+ * inbound track to a <video> element via ontrack.
+ */
+export function useReceiverConnection() {
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [pcState, setPcState] = useState<RTCPeerConnectionState>("new");
+  const [iceState, setIceState] = useState<RTCIceConnectionState>("new");
+  const [stats, setStats] = useState<LinkStats>(EMPTY_STATS);
+  const [error, setError] = useState<string | null>(null);
+
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const statsTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const prevBytes = useRef(0);
+  const prevTs = useRef(0);
+  const pendingCandidates = useRef<RTCIceCandidateInit[]>([]);
+
+  const sendAnswer = useSignalStore((s) => s.sendAnswer);
+  const sendCandidate = useSignalStore((s) => s.sendCandidate);
+  const setHandlers = useSignalStore((s) => s.setHandlers);
+  const clearHandlers = useSignalStore((s) => s.clearHandlers);
+
+  const stopStats = useCallback(() => {
+    if (statsTimer.current) {
+      clearInterval(statsTimer.current);
+      statsTimer.current = null;
+    }
+  }, []);
+
+  const teardown = useCallback(() => {
+    stopStats();
+    const pc = pcRef.current;
+    if (pc) {
+      pc.ontrack = null;
+      pc.onicecandidate = null;
+      pc.onconnectionstatechange = null;
+      pc.oniceconnectionstatechange = null;
+      pc.close();
+      pcRef.current = null;
+    }
+    setRemoteStream(null);
+    setPcState("new");
+    setIceState("new");
+    setStats(EMPTY_STATS);
+    pendingCandidates.current = [];
+    prevBytes.current = 0;
+    prevTs.current = 0;
+  }, [stopStats]);
+
+  const ensurePc = useCallback(() => {
+    if (pcRef.current) return pcRef.current;
+    const pc = createPeerConnection();
+    pcRef.current = pc;
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) sendCandidate(e.candidate.toJSON());
+    };
+    pc.onconnectionstatechange = () => setPcState(pc.connectionState);
+    pc.oniceconnectionstatechange = () => setIceState(pc.iceConnectionState);
+
+    // Prefer VP8/H264 on the receiving transceiver too.
+    pc.ontrack = (e) => {
+      const stream = e.streams[0] ?? new MediaStream([e.track]);
+      setRemoteStream(stream);
+    };
+    return pc;
+  }, [sendCandidate]);
+
+  // Register signaling handlers: offer → answer, candidate relay.
+  useEffect(() => {
+    setHandlers({
+      onOffer: async (sdp) => {
+        try {
+          const pc = ensurePc();
+          await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+          applyReceiverCodecPreferences(pc);
+          // flush candidates that arrived before the remote description
+          for (const c of pendingCandidates.current) {
+            await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+          }
+          pendingCandidates.current = [];
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          sendAnswer(answer);
+        } catch (err) {
+          setError(`处理 Offer 失败: ${(err as Error).message}`);
+        }
+      },
+      onCandidate: async (candidate) => {
+        const pc = pcRef.current;
+        if (!pc || !pc.remoteDescription) {
+          pendingCandidates.current.push(candidate);
+          return;
+        }
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          setError(`添加 ICE 候选失败: ${(err as Error).message}`);
+        }
+      },
+      onPeerLeft: () => {
+        teardown();
+      },
+    });
+
+    stopStats();
+    statsTimer.current = setInterval(async () => {
+      if (!pcRef.current || pcState !== "connected") return;
+      const { stats: next, bytes, ts } = await readLinkStats(
+        pcRef.current,
+        "receiver",
+        prevBytes.current,
+        prevTs.current,
+      );
+      prevBytes.current = bytes;
+      prevTs.current = ts;
+      setStats(next);
+    }, 1000);
+
+    return () => {
+      clearHandlers();
+      teardown();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setHandlers, clearHandlers, ensurePc, sendAnswer, stopStats, teardown]);
+
+  return {
+    remoteStream,
+    pcState,
+    pcLabel: pcStateLabel(pcState),
+    iceLabel: iceStateLabel(iceState),
+    stats,
+    error,
+  };
+}
