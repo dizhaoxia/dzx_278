@@ -1,12 +1,14 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { ArrowLeft, LogOut } from "lucide-react";
 import AppHeader from "@/components/AppHeader";
 import VideoFrame from "@/components/VideoFrame";
+import AnnotationCanvas from "@/components/AnnotationCanvas";
 import StatusPanel from "@/components/StatusPanel";
 import { useSignalStore } from "@/store/useSignalStore";
 import { useReceiverConnection } from "@/hooks/useReceiverConnection";
 import { wsStateLabel } from "@/lib/webrtc";
+import type { Annotation, AnnotationAction } from "@/lib/annotations";
 
 export default function Receiver() {
   const navigate = useNavigate();
@@ -14,8 +16,18 @@ export default function Receiver() {
   const wsStatus = useSignalStore((s) => s.wsStatus);
   const leaveRoom = useSignalStore((s) => s.leaveRoom);
 
-  const { remoteStream, pcLabel, iceLabel, stats, error } = useReceiverConnection();
+  const {
+    remoteStream,
+    pcLabel,
+    iceLabel,
+    stats,
+    error,
+    dataChannelReady,
+    sendAnnotationAction,
+    setAnnotationHandler,
+  } = useReceiverConnection();
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
 
   useEffect(() => {
     if (videoRef.current) {
@@ -29,6 +41,44 @@ export default function Receiver() {
   useEffect(() => {
     if (!roomId) navigate("/");
   }, [roomId, navigate]);
+
+  useEffect(() => {
+    setAnnotationHandler((action: AnnotationAction) => {
+      switch (action.type) {
+        case "add":
+          setAnnotations((prev) => [...prev, action.annotation]);
+          break;
+        case "undo":
+          setAnnotations((prev) => prev.slice(0, -1));
+          break;
+        case "clear":
+          setAnnotations([]);
+          break;
+        case "init":
+          setAnnotations(action.annotations);
+          break;
+      }
+    });
+    return () => setAnnotationHandler(null);
+  }, [setAnnotationHandler]);
+
+  const handleAnnotationAdd = useCallback(
+    (ann: Annotation) => {
+      setAnnotations((prev) => [...prev, ann]);
+      sendAnnotationAction({ type: "add", annotation: ann });
+    },
+    [sendAnnotationAction],
+  );
+
+  const handleUndo = useCallback(() => {
+    setAnnotations((prev) => prev.slice(0, -1));
+    sendAnnotationAction({ type: "undo" });
+  }, [sendAnnotationAction]);
+
+  const handleClear = useCallback(() => {
+    setAnnotations([]);
+    sendAnnotationAction({ type: "clear" });
+  }, [sendAnnotationAction]);
 
   const wsReadyState = wsStatus === "open" ? 1 : wsStatus === "connecting" ? 0 : 3;
   const pcOn = pcLabel === "LINKED";
@@ -63,8 +113,34 @@ export default function Receiver() {
 
         <div className="grid gap-6 lg:grid-cols-[1.4fr_1fr]">
           <section className="flex flex-col gap-4">
-            <VideoFrame ref={videoRef} scanning={!remoteStream} caption={remoteStream ? "REMOTE · INBOUND" : undefined} />
-            <div className="flex flex-wrap gap-3">
+            <div className="panel relative aspect-video w-full overflow-hidden bg-ink-950 shadow-inset">
+              <VideoFrame
+                ref={videoRef}
+                scanning={!remoteStream}
+                caption={remoteStream ? "REMOTE · INBOUND" : undefined}
+                className="absolute inset-0"
+              />
+              <AnnotationCanvas
+                editable={!!remoteStream}
+                videoRef={videoRef}
+                annotations={annotations}
+                onAnnotationAdd={handleAnnotationAdd}
+                onUndo={handleUndo}
+                onClear={handleClear}
+                className="absolute inset-0"
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <span
+                className={[
+                  "chip",
+                  dataChannelReady
+                    ? "border-signal/40 text-signal"
+                    : "border-ink-600 text-fg-muted",
+                ].join(" ")}
+              >
+                标注通道: {dataChannelReady ? "已连接" : "未连接"}
+              </span>
               <span className="chip border-ink-600 text-fg-soft">
                 自动应答已启用 · 无需操作
               </span>

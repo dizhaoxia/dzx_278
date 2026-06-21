@@ -8,6 +8,7 @@ import {
   readLinkStats,
   type LinkStats,
 } from "@/lib/webrtc";
+import type { AnnotationAction } from "@/lib/annotations";
 
 const EMPTY_STATS: LinkStats = {
   bitrateKbps: 0,
@@ -31,6 +32,7 @@ export function useReceiverConnection() {
   const [iceState, setIceState] = useState<RTCIceConnectionState>("new");
   const [stats, setStats] = useState<LinkStats>(EMPTY_STATS);
   const [error, setError] = useState<string | null>(null);
+  const [dataChannelReady, setDataChannelReady] = useState(false);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const statsTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -38,6 +40,8 @@ export function useReceiverConnection() {
   const prevTs = useRef(0);
   const pendingCandidates = useRef<RTCIceCandidateInit[]>([]);
   const pcStateRef = useRef<RTCPeerConnectionState>("new");
+  const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const onAnnotationRef = useRef<((action: AnnotationAction) => void) | null>(null);
 
   const sendAnswer = useSignalStore((s) => s.sendAnswer);
   const sendCandidate = useSignalStore((s) => s.sendCandidate);
@@ -53,12 +57,22 @@ export function useReceiverConnection() {
 
   const teardown = useCallback(() => {
     stopStats();
+    const dc = dataChannelRef.current;
+    if (dc) {
+      try {
+        dc.close();
+      } catch {
+        /* noop */
+      }
+      dataChannelRef.current = null;
+    }
     const pc = pcRef.current;
     if (pc) {
       pc.ontrack = null;
       pc.onicecandidate = null;
       pc.onconnectionstatechange = null;
       pc.oniceconnectionstatechange = null;
+      pc.ondatachannel = null;
       pc.close();
       pcRef.current = null;
     }
@@ -66,6 +80,7 @@ export function useReceiverConnection() {
     setPcState("new");
     setIceState("new");
     setStats(EMPTY_STATS);
+    setDataChannelReady(false);
     pendingCandidates.current = [];
     prevBytes.current = 0;
     prevTs.current = 0;
@@ -89,6 +104,28 @@ export function useReceiverConnection() {
       const stream = e.streams[0] ?? new MediaStream([e.track]);
       setRemoteStream(stream);
     };
+
+    pc.ondatachannel = (e) => {
+      const dc = e.channel;
+      if (dc.label !== "annotation") return;
+      dataChannelRef.current = dc;
+
+      dc.onopen = () => {
+        setDataChannelReady(true);
+      };
+      dc.onclose = () => {
+        setDataChannelReady(false);
+      };
+      dc.onmessage = (ev) => {
+        try {
+          const action = JSON.parse(ev.data) as AnnotationAction;
+          onAnnotationRef.current?.(action);
+        } catch {
+          /* ignore malformed messages */
+        }
+      };
+    };
+
     return pc;
   }, [sendCandidate]);
 
@@ -147,8 +184,25 @@ export function useReceiverConnection() {
       clearHandlers();
       teardown();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [setHandlers, clearHandlers, ensurePc, sendAnswer, stopStats, teardown]);
+
+  const sendAnnotationAction = useCallback((action: AnnotationAction) => {
+    const dc = dataChannelRef.current;
+    if (dc && dc.readyState === "open") {
+      try {
+        dc.send(JSON.stringify(action));
+      } catch {
+        /* ignore send errors */
+      }
+    }
+  }, []);
+
+  const setAnnotationHandler = useCallback(
+    (handler: ((action: AnnotationAction) => void) | null) => {
+      onAnnotationRef.current = handler;
+    },
+    [],
+  );
 
   return {
     remoteStream,
@@ -157,5 +211,8 @@ export function useReceiverConnection() {
     iceLabel: iceStateLabel(iceState),
     stats,
     error,
+    dataChannelReady,
+    sendAnnotationAction,
+    setAnnotationHandler,
   };
 }

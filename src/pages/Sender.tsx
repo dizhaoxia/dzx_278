@@ -1,12 +1,14 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ScreenShare, Square, Copy, ArrowLeft } from "lucide-react";
 import AppHeader from "@/components/AppHeader";
 import VideoFrame from "@/components/VideoFrame";
+import AnnotationCanvas from "@/components/AnnotationCanvas";
 import StatusPanel from "@/components/StatusPanel";
 import { useSignalStore } from "@/store/useSignalStore";
 import { useSenderConnection } from "@/hooks/useSenderConnection";
 import { wsStateLabel } from "@/lib/webrtc";
+import type { Annotation, AnnotationAction } from "@/lib/annotations";
 
 export default function Sender() {
   const navigate = useNavigate();
@@ -22,11 +24,13 @@ export default function Sender() {
     stats,
     capturing,
     error,
+    dataChannelReady,
     captureScreen,
     stopSharing,
+    setAnnotationHandler,
   } = useSenderConnection();
-
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
 
   useEffect(() => {
     if (videoRef.current && localStream) {
@@ -35,10 +39,29 @@ export default function Sender() {
     }
   }, [localStream]);
 
-  // If the user lands here without a room (e.g. refresh), send them home.
   useEffect(() => {
     if (!roomId) navigate("/");
   }, [roomId, navigate]);
+
+  useEffect(() => {
+    setAnnotationHandler((action: AnnotationAction) => {
+      switch (action.type) {
+        case "add":
+          setAnnotations((prev) => [...prev, action.annotation]);
+          break;
+        case "undo":
+          setAnnotations((prev) => prev.slice(0, -1));
+          break;
+        case "clear":
+          setAnnotations([]);
+          break;
+        case "init":
+          setAnnotations(action.annotations);
+          break;
+      }
+    });
+    return () => setAnnotationHandler(null);
+  }, [setAnnotationHandler]);
 
   const hasPeer = peers.length > 0;
   const wsReadyState = wsStatus === "open" ? 1 : wsStatus === "connecting" ? 0 : 3;
@@ -84,12 +107,21 @@ export default function Sender() {
 
         <div className="grid gap-6 lg:grid-cols-[1.4fr_1fr]">
           <section className="flex flex-col gap-4">
-            <VideoFrame
-              ref={videoRef}
-              caption={localStream ? "LOCAL · SCREEN" : undefined}
-              scanning={!localStream}
-            />
-            <div className="flex flex-wrap gap-3">
+            <div className="panel relative aspect-video w-full overflow-hidden bg-ink-950 shadow-inset">
+              <VideoFrame
+                ref={videoRef}
+                caption={localStream ? "LOCAL · SCREEN" : undefined}
+                scanning={!localStream}
+                className="absolute inset-0"
+              />
+              <AnnotationCanvas
+                editable={false}
+                videoRef={videoRef}
+                annotations={annotations}
+                className="absolute inset-0"
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
               {!localStream ? (
                 <button className="btn btn-primary" onClick={captureScreen} disabled={capturing}>
                   <ScreenShare className="h-4 w-4" />
@@ -99,6 +131,16 @@ export default function Sender() {
                 <>
                   <span className="chip border-signal/40 text-signal">
                     {hasPeer ? "传输中" : "已就绪 · 等待 B端"}
+                  </span>
+                  <span
+                    className={[
+                      "chip",
+                      dataChannelReady
+                        ? "border-signal/40 text-signal"
+                        : "border-ink-600 text-fg-muted",
+                    ].join(" ")}
+                  >
+                    标注通道: {dataChannelReady ? "已连接" : "未连接"}
                   </span>
                   <button className="btn btn-danger" onClick={stopSharing}>
                     <Square className="h-4 w-4" />

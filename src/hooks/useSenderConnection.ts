@@ -8,6 +8,7 @@ import {
   readLinkStats,
   type LinkStats,
 } from "@/lib/webrtc";
+import type { AnnotationAction } from "@/lib/annotations";
 
 const EMPTY_STATS: LinkStats = {
   bitrateKbps: 0,
@@ -32,6 +33,7 @@ export function useSenderConnection() {
   const [stats, setStats] = useState<LinkStats>(EMPTY_STATS);
   const [capturing, setCapturing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [dataChannelReady, setDataChannelReady] = useState(false);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -39,6 +41,8 @@ export function useSenderConnection() {
   const statsTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevBytes = useRef(0);
   const prevTs = useRef(0);
+  const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const onAnnotationRef = useRef<((action: AnnotationAction) => void) | null>(null);
 
   const sendOffer = useSignalStore((s) => s.sendOffer);
   const sendCandidate = useSignalStore((s) => s.sendCandidate);
@@ -55,6 +59,15 @@ export function useSenderConnection() {
 
   const teardown = useCallback(() => {
     stopStats();
+    const dc = dataChannelRef.current;
+    if (dc) {
+      try {
+        dc.close();
+      } catch {
+        /* noop */
+      }
+      dataChannelRef.current = null;
+    }
     const pc = pcRef.current;
     if (pc) {
       try {
@@ -65,6 +78,7 @@ export function useSenderConnection() {
       pc.onicecandidate = null;
       pc.onconnectionstatechange = null;
       pc.oniceconnectionstatechange = null;
+      pc.ondatachannel = null;
       pc.close();
       pcRef.current = null;
     }
@@ -72,6 +86,7 @@ export function useSenderConnection() {
     setPcState("new");
     setIceState("new");
     setStats(EMPTY_STATS);
+    setDataChannelReady(false);
     prevBytes.current = 0;
     prevTs.current = 0;
   }, [stopStats]);
@@ -84,6 +99,24 @@ export function useSenderConnection() {
 
     const pc = createPeerConnection();
     pcRef.current = pc;
+
+    const dc = pc.createDataChannel("annotation", { ordered: true });
+    dataChannelRef.current = dc;
+
+    dc.onopen = () => {
+      setDataChannelReady(true);
+    };
+    dc.onclose = () => {
+      setDataChannelReady(false);
+    };
+    dc.onmessage = (e) => {
+      try {
+        const action = JSON.parse(e.data) as AnnotationAction;
+        onAnnotationRef.current?.(action);
+      } catch {
+        /* ignore malformed messages */
+      }
+    };
 
     pc.onicecandidate = (e) => {
       if (e.candidate) sendCandidate(e.candidate.toJSON());
@@ -186,6 +219,24 @@ export function useSenderConnection() {
     teardown();
   }, [teardown]);
 
+  const sendAnnotationAction = useCallback((action: AnnotationAction) => {
+    const dc = dataChannelRef.current;
+    if (dc && dc.readyState === "open") {
+      try {
+        dc.send(JSON.stringify(action));
+      } catch {
+        /* ignore send errors */
+      }
+    }
+  }, []);
+
+  const setAnnotationHandler = useCallback(
+    (handler: ((action: AnnotationAction) => void) | null) => {
+      onAnnotationRef.current = handler;
+    },
+    [],
+  );
+
   return {
     localStream,
     pcState,
@@ -194,7 +245,10 @@ export function useSenderConnection() {
     stats,
     capturing,
     error,
+    dataChannelReady,
     captureScreen,
     stopSharing,
+    sendAnnotationAction,
+    setAnnotationHandler,
   };
 }
