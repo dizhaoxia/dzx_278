@@ -36,6 +36,8 @@ app.use(
 
 app.use(
   (error: Error, _req: Request, res: Response, _next: NextFunction): void => {
+    void error
+    void _next
     res.status(500).json({ success: false, error: 'Server internal error' })
   },
 )

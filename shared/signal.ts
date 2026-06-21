@@ -10,6 +10,8 @@ export type Role = "sender" | "receiver";
 
 export type WsStatus = "idle" | "connecting" | "open" | "closed";
 
+export type AnnotationMode = "host" | "free";
+
 export type SignalMessageType =
   | "connected"
   | "create-room"
@@ -23,7 +25,12 @@ export type SignalMessageType =
   | "candidate"
   | "leave"
   | "error"
-  | "state";
+  | "state"
+  | "set-annotation-mode"
+  | "annotation-mode-changed"
+  | "authorize-annotator"
+  | "revoke-annotator"
+  | "annotators-changed";
 
 export interface SignalMessage {
   type: SignalMessageType;
@@ -41,11 +48,12 @@ export interface RoomCreatedPayload {
 export interface JoinedPayload {
   roomId: string;
   clientId: string;
-  peerId?: string;
+  peers?: string[];
 }
 
 export interface PeerPayload {
   peerId: string;
+  role?: Role;
 }
 
 export interface ErrorPayload {
@@ -58,4 +66,30 @@ export interface SdpPayload {
 
 export interface CandidatePayload {
   candidate: RTCIceCandidateInit;
+}
+
+export interface RoomMember {
+  clientId: string;
+  role: Role;
+  displayName?: string;
+}
+
+export interface RoomStatePayload {
+  roomId: string;
+  members: RoomMember[];
+  annotationMode: AnnotationMode;
+  authorizedAnnotators: string[];
+  senderId: string | null;
+}
+
+export interface AnnotationModePayload {
+  mode: AnnotationMode;
+}
+
+export interface AnnotatorPayload {
+  clientId: string;
+}
+
+export interface AnnotatorsChangedPayload {
+  authorizedAnnotators: string[];
 }

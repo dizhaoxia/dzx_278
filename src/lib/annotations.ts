@@ -5,6 +5,8 @@ export interface BaseAnnotation {
   type: AnnotationType;
   color: string;
   lineWidth: number;
+  timestamp?: number;
+  authorId?: string;
 }
 
 export interface PenAnnotation extends BaseAnnotation {
@@ -42,11 +44,23 @@ export type Annotation =
   | ArrowAnnotation
   | TextAnnotation;
 
+export type TimedAnnotationAction =
+  | { type: "add"; annotation: Annotation; timestamp: number }
+  | { type: "undo"; timestamp: number }
+  | { type: "clear"; timestamp: number }
+  | { type: "init"; annotations: Annotation[]; timestamp: number };
+
 export type AnnotationAction =
   | { type: "add"; annotation: Annotation }
   | { type: "undo" }
   | { type: "clear" }
   | { type: "init"; annotations: Annotation[] };
+
+export interface AnnotationHistory {
+  actions: TimedAnnotationAction[];
+  duration: number;
+  startTime: number;
+}
 
 export const ANNOTATION_COLORS = [
   "#ff3b30",
@@ -136,4 +150,37 @@ export function drawAllAnnotations(
   annotations: Annotation[],
 ): void {
   annotations.forEach((ann) => drawAnnotation(ctx, ann));
+}
+
+export function stampAction(
+  action: AnnotationAction,
+  baseTime: number,
+): TimedAnnotationAction {
+  return { ...action, timestamp: Date.now() - baseTime } as TimedAnnotationAction;
+}
+
+export function replayAnnotations(
+  actions: TimedAnnotationAction[],
+  upToTime: number,
+): Annotation[] {
+  const result: Annotation[] = [];
+  for (const a of actions) {
+    if (a.timestamp > upToTime) break;
+    switch (a.type) {
+      case "add":
+        result.push(a.annotation);
+        break;
+      case "undo":
+        result.pop();
+        break;
+      case "clear":
+        result.length = 0;
+        break;
+      case "init":
+        result.length = 0;
+        result.push(...a.annotations);
+        break;
+    }
+  }
+  return result;
 }

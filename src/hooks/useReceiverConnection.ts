@@ -8,7 +8,8 @@ import {
   readLinkStats,
   type LinkStats,
 } from "@/lib/webrtc";
-import type { AnnotationAction } from "@/lib/annotations";
+import type { AnnotationAction, TimedAnnotationAction } from "@/lib/annotations";
+import { stampAction } from "@/lib/annotations";
 
 const EMPTY_STATS: LinkStats = {
   bitrateKbps: 0,
@@ -25,6 +26,8 @@ const EMPTY_STATS: LinkStats = {
  * B端 (receiver) WebRTC lifecycle: create the RTCPeerConnection lazily when
  * the offer arrives, set the remote description, answer, and bind the
  * inbound track to a <video> element via ontrack.
+ *
+ * Supports annotation permission check against the room's authorized list.
  */
 export function useReceiverConnection() {
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
@@ -33,6 +36,9 @@ export function useReceiverConnection() {
   const [stats, setStats] = useState<LinkStats>(EMPTY_STATS);
   const [error, setError] = useState<string | null>(null);
   const [dataChannelReady, setDataChannelReady] = useState(false);
+  const [historyStartTime, setHistoryStartTime] = useState<number>(0);
+  const [history, setHistory] = useState<TimedAnnotationAction[]>([]);
+  const [canAnnotate, setCanAnnotate] = useState(false);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const statsTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -47,6 +53,16 @@ export function useReceiverConnection() {
   const sendCandidate = useSignalStore((s) => s.sendCandidate);
   const setHandlers = useSignalStore((s) => s.setHandlers);
   const clearHandlers = useSignalStore((s) => s.clearHandlers);
+  const clientId = useSignalStore((s) => s.clientId);
+  const authorizedAnnotators = useSignalStore((s) => s.authorizedAnnotators);
+  const annotationMode = useSignalStore((s) => s.annotationMode);
+
+  useEffect(() => {
+    const authorized =
+      annotationMode === "free" ||
+      (!!clientId && authorizedAnnotators.includes(clientId));
+    setCanAnnotate(authorized);
+  }, [annotationMode, authorizedAnnotators, clientId]);
 
   const stopStats = useCallback(() => {
     if (statsTimer.current) {
@@ -90,6 +106,7 @@ export function useReceiverConnection() {
     if (pcRef.current) return pcRef.current;
     const pc = createPeerConnection();
     pcRef.current = pc;
+    if (historyStartTime === 0) setHistoryStartTime(Date.now());
 
     pc.onicecandidate = (e) => {
       if (e.candidate) sendCandidate(e.candidate.toJSON());
@@ -120,6 +137,9 @@ export function useReceiverConnection() {
         try {
           const action = JSON.parse(ev.data) as AnnotationAction;
           onAnnotationRef.current?.(action);
+          if (historyStartTime > 0) {
+            setHistory((prev) => [...prev, stampAction(action, historyStartTime)]);
+          }
         } catch {
           /* ignore malformed messages */
         }
@@ -127,24 +147,22 @@ export function useReceiverConnection() {
     };
 
     return pc;
-  }, [sendCandidate]);
+  }, [sendCandidate, historyStartTime]);
 
-  // Register signaling handlers: offer → answer, candidate relay.
   useEffect(() => {
     setHandlers({
-      onOffer: async (sdp) => {
+      onOffer: async (sdp, from) => {
         try {
           const pc = ensurePc();
           await pc.setRemoteDescription(new RTCSessionDescription(sdp));
           applyReceiverCodecPreferences(pc);
-          // flush candidates that arrived before the remote description
           for (const c of pendingCandidates.current) {
             await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
           }
           pendingCandidates.current = [];
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
-          sendAnswer(answer);
+          sendAnswer(answer, from);
         } catch (err) {
           setError(`处理 Offer 失败: ${(err as Error).message}`);
         }
@@ -191,11 +209,14 @@ export function useReceiverConnection() {
     if (dc && dc.readyState === "open") {
       try {
         dc.send(JSON.stringify(action));
+        if (historyStartTime > 0) {
+          setHistory((prev) => [...prev, stampAction(action, historyStartTime)]);
+        }
       } catch {
         /* ignore send errors */
       }
     }
-  }, []);
+  }, [historyStartTime]);
 
   const setAnnotationHandler = useCallback(
     (handler: ((action: AnnotationAction) => void) | null) => {
@@ -212,6 +233,9 @@ export function useReceiverConnection() {
     stats,
     error,
     dataChannelReady,
+    canAnnotate,
+    history,
+    historyStartTime,
     sendAnnotationAction,
     setAnnotationHandler,
   };

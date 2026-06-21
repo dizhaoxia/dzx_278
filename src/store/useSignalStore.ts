@@ -13,6 +13,11 @@ import type {
   CandidatePayload,
   PeerPayload,
   ErrorPayload,
+  AnnotationMode,
+  RoomStatePayload,
+  AnnotationModePayload,
+  AnnotatorsChangedPayload,
+  RoomMember,
 } from "@shared/signal";
 
 const SIGNALING_URL = (() => {
@@ -30,7 +35,10 @@ export type CandidateHandler = (
   candidate: RTCIceCandidateInit,
   from: string,
 ) => void;
-export type PeerHandler = (peerId: string) => void;
+export type PeerHandler = (peerId: string, role?: "sender" | "receiver") => void;
+export type AnnotationModeHandler = (mode: AnnotationMode) => void;
+export type AnnotatorsChangedHandler = (authorizedAnnotators: string[]) => void;
+export type RoomStateHandler = (state: RoomStatePayload) => void;
 
 interface SignalState {
   wsStatus: WsStatus;
@@ -38,14 +46,20 @@ interface SignalState {
   roomId: string | null;
   role: "sender" | "receiver" | null;
   peers: string[];
+  members: RoomMember[];
   error: string | null;
+  annotationMode: AnnotationMode;
+  authorizedAnnotators: string[];
+  senderId: string | null;
 
-  // pluggable WebRTC handlers
   onOffer: OfferHandler | null;
   onAnswer: AnswerHandler | null;
   onCandidate: CandidateHandler | null;
   onPeerJoined: PeerHandler | null;
   onPeerLeft: PeerHandler | null;
+  onAnnotationModeChanged: AnnotationModeHandler | null;
+  onAnnotatorsChanged: AnnotatorsChangedHandler | null;
+  onRoomState: RoomStateHandler | null;
 
   connect: () => void;
   disconnect: () => void;
@@ -55,14 +69,20 @@ interface SignalState {
     onCandidate?: CandidateHandler;
     onPeerJoined?: PeerHandler;
     onPeerLeft?: PeerHandler;
+    onAnnotationModeChanged?: AnnotationModeHandler;
+    onAnnotatorsChanged?: AnnotatorsChangedHandler;
+    onRoomState?: RoomStateHandler;
   }) => void;
   clearHandlers: () => void;
   createRoom: () => void;
   joinRoom: (roomId: string) => void;
   leaveRoom: () => void;
-  sendOffer: (sdp: RTCSessionDescriptionInit) => void;
-  sendAnswer: (sdp: RTCSessionDescriptionInit) => void;
-  sendCandidate: (candidate: RTCIceCandidateInit) => void;
+  sendOffer: (sdp: RTCSessionDescriptionInit, to?: string) => void;
+  sendAnswer: (sdp: RTCSessionDescriptionInit, to?: string) => void;
+  sendCandidate: (candidate: RTCIceCandidateInit, to?: string) => void;
+  setAnnotationMode: (mode: AnnotationMode) => void;
+  authorizeAnnotator: (clientId: string) => void;
+  revokeAnnotator: (clientId: string) => void;
   clearError: () => void;
 }
 
@@ -81,13 +101,20 @@ export const useSignalStore = create<SignalState>((set, get) => ({
   roomId: null,
   role: null,
   peers: [],
+  members: [],
   error: null,
+  annotationMode: "host",
+  authorizedAnnotators: [],
+  senderId: null,
 
   onOffer: null,
   onAnswer: null,
   onCandidate: null,
   onPeerJoined: null,
   onPeerLeft: null,
+  onAnnotationModeChanged: null,
+  onAnnotatorsChanged: null,
+  onRoomState: null,
 
   connect: () => {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
@@ -105,7 +132,11 @@ export const useSignalStore = create<SignalState>((set, get) => ({
         roomId: null,
         role: null,
         peers: [],
+        members: [],
         clientId: null,
+        annotationMode: "host",
+        authorizedAnnotators: [],
+        senderId: null,
       });
       if (reconnectTimer) clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(() => get().connect(), 2500);
@@ -136,7 +167,17 @@ export const useSignalStore = create<SignalState>((set, get) => ({
       ws.close();
       ws = null;
     }
-    set({ wsStatus: "closed", roomId: null, role: null, peers: [], clientId: null });
+    set({
+      wsStatus: "closed",
+      roomId: null,
+      role: null,
+      peers: [],
+      members: [],
+      clientId: null,
+      annotationMode: "host",
+      authorizedAnnotators: [],
+      senderId: null,
+    });
   },
 
   setHandlers: (h) =>
@@ -146,6 +187,9 @@ export const useSignalStore = create<SignalState>((set, get) => ({
       onCandidate: h.onCandidate ?? state.onCandidate,
       onPeerJoined: h.onPeerJoined ?? state.onPeerJoined,
       onPeerLeft: h.onPeerLeft ?? state.onPeerLeft,
+      onAnnotationModeChanged: h.onAnnotationModeChanged ?? state.onAnnotationModeChanged,
+      onAnnotatorsChanged: h.onAnnotatorsChanged ?? state.onAnnotatorsChanged,
+      onRoomState: h.onRoomState ?? state.onRoomState,
     })),
 
   clearHandlers: () =>
@@ -155,6 +199,9 @@ export const useSignalStore = create<SignalState>((set, get) => ({
       onCandidate: null,
       onPeerJoined: null,
       onPeerLeft: null,
+      onAnnotationModeChanged: null,
+      onAnnotatorsChanged: null,
+      onRoomState: null,
     }),
 
   createRoom: () => sendMsg({ type: "create-room" }),
@@ -162,24 +209,59 @@ export const useSignalStore = create<SignalState>((set, get) => ({
   joinRoom: (roomId) =>
     sendMsg({
       type: "join-room",
-      payload: { roomId: roomId.toUpperCase().trim() },
+      payload: { roomId: roomId.toUpperCase().trim() } as unknown as Record<string, unknown>,
     }),
 
   leaveRoom: () => {
     sendMsg({ type: "leave" });
-    set({ roomId: null, role: null, peers: [] });
+    set({
+      roomId: null,
+      role: null,
+      peers: [],
+      members: [],
+      annotationMode: "host",
+      authorizedAnnotators: [],
+      senderId: null,
+    });
   },
 
-  sendOffer: (sdp) =>
-    sendMsg({ type: "offer", payload: { sdp } as unknown as Record<string, unknown> }),
+  sendOffer: (sdp, to) =>
+    sendMsg({
+      type: "offer",
+      payload: { sdp } as unknown as Record<string, unknown>,
+      to,
+    }),
 
-  sendAnswer: (sdp) =>
-    sendMsg({ type: "answer", payload: { sdp } as unknown as Record<string, unknown> }),
+  sendAnswer: (sdp, to) =>
+    sendMsg({
+      type: "answer",
+      payload: { sdp } as unknown as Record<string, unknown>,
+      to,
+    }),
 
-  sendCandidate: (candidate) =>
+  sendCandidate: (candidate, to) =>
     sendMsg({
       type: "candidate",
       payload: { candidate } as unknown as Record<string, unknown>,
+      to,
+    }),
+
+  setAnnotationMode: (mode) =>
+    sendMsg({
+      type: "set-annotation-mode",
+      payload: { mode } as unknown as Record<string, unknown>,
+    }),
+
+  authorizeAnnotator: (clientId) =>
+    sendMsg({
+      type: "authorize-annotator",
+      payload: { clientId } as unknown as Record<string, unknown>,
+    }),
+
+  revokeAnnotator: (clientId) =>
+    sendMsg({
+      type: "revoke-annotator",
+      payload: { clientId } as unknown as Record<string, unknown>,
     }),
 
   clearError: () => set({ error: null }),
@@ -198,7 +280,15 @@ function handleIncoming(msg: SignalMessage): void {
         roomId: string;
         clientId: string;
       };
-      store.setState({ roomId, clientId, role: "sender", peers: [] });
+      store.setState({
+        roomId,
+        clientId,
+        role: "sender",
+        peers: [],
+        annotationMode: "host",
+        authorizedAnnotators: [clientId],
+        senderId: clientId,
+      });
       break;
     }
     case "joined": {
@@ -207,18 +297,24 @@ function handleIncoming(msg: SignalMessage): void {
         clientId: string;
         peers?: string[];
       };
-      store.setState({ roomId, clientId, role: "receiver", peers: peers ?? [] });
+      store.setState({
+        roomId,
+        clientId,
+        role: "receiver",
+        peers: peers ?? [],
+      });
       break;
     }
     case "peer-joined": {
-      const peerId =
-        (msg.payload as unknown as PeerPayload)?.peerId ?? msg.from ?? "";
+      const payload = (msg.payload ?? {}) as unknown as PeerPayload;
+      const peerId = payload.peerId ?? msg.from ?? "";
+      const role = payload.role;
       store.setState((state) => ({
         peers: state.peers.includes(peerId)
           ? state.peers
           : [...state.peers, peerId],
       }));
-      store.getState().onPeerJoined?.(peerId);
+      store.getState().onPeerJoined?.(peerId, role);
       break;
     }
     case "peer-left": {
@@ -226,6 +322,7 @@ function handleIncoming(msg: SignalMessage): void {
         (msg.payload as unknown as PeerPayload)?.peerId ?? msg.from ?? "";
       store.setState((state) => ({
         peers: state.peers.filter((p) => p !== peerId),
+        authorizedAnnotators: state.authorizedAnnotators.filter((p) => p !== peerId),
       }));
       store.getState().onPeerLeft?.(peerId);
       break;
@@ -249,12 +346,32 @@ function handleIncoming(msg: SignalMessage): void {
       break;
     }
     case "state": {
-      const members =
-        (msg.payload?.members as { clientId: string }[] | undefined) ?? [];
-      const peers = members.map((m) => m.clientId);
-      store.setState((state) => ({
-        peers: peers.filter((p) => p !== state.clientId),
-      }));
+      const payload = msg.payload as unknown as RoomStatePayload;
+      const members = payload.members ?? [];
+      const peers = members
+        .map((m) => m.clientId)
+        .filter((p) => p !== store.getState().clientId);
+      store.setState({
+        members,
+        peers,
+        annotationMode: payload.annotationMode ?? "host",
+        authorizedAnnotators: payload.authorizedAnnotators ?? [],
+        senderId: payload.senderId ?? null,
+      });
+      store.getState().onRoomState?.(payload);
+      break;
+    }
+    case "annotation-mode-changed": {
+      const { mode } = (msg.payload ?? {}) as unknown as AnnotationModePayload;
+      store.setState({ annotationMode: mode });
+      store.getState().onAnnotationModeChanged?.(mode);
+      break;
+    }
+    case "annotators-changed": {
+      const { authorizedAnnotators } =
+        (msg.payload ?? {}) as unknown as AnnotatorsChangedPayload;
+      store.setState({ authorizedAnnotators: authorizedAnnotators ?? [] });
+      store.getState().onAnnotatorsChanged?.(authorizedAnnotators ?? []);
       break;
     }
     case "error": {

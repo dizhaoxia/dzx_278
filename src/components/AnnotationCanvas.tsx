@@ -29,10 +29,12 @@ export interface AnnotationCanvasHandle {
   clear: () => void;
   getAnnotations: () => Annotation[];
   setAnnotations: (anns: Annotation[]) => void;
+  getCanvas: () => HTMLCanvasElement | null;
 }
 
 interface AnnotationCanvasProps {
   editable?: boolean;
+  canAnnotate?: boolean;
   videoRef?: React.RefObject<HTMLVideoElement>;
   onAnnotationAdd?: (ann: Annotation) => void;
   onUndo?: () => void;
@@ -50,9 +52,19 @@ const TOOLS: { type: AnnotationType; icon: React.ElementType; label: string }[] 
 
 const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCanvasProps>(
   function AnnotationCanvas(
-    { editable = false, videoRef, onAnnotationAdd, onUndo, onClear, annotations: externalAnnotations, className },
+    {
+      editable = false,
+      canAnnotate,
+      videoRef,
+      onAnnotationAdd,
+      onUndo,
+      onClear,
+      annotations: externalAnnotations,
+      className,
+    },
     ref,
   ) {
+    const effectiveEditable = editable && (canAnnotate ?? true);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const drawingRef = useRef(false);
@@ -180,7 +192,7 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCanvasProp
 
     const handleMouseDown = useCallback(
       (e: React.MouseEvent<HTMLCanvasElement>) => {
-        if (!editable) return;
+        if (!effectiveEditable) return;
         const pos = screenToVideo(e.clientX, e.clientY);
         startPosRef.current = pos;
         drawingRef.current = true;
@@ -206,12 +218,12 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCanvasProp
           drawingRef.current = false;
         }
       },
-      [editable, tool, color, lineWidth, screenToVideo, onAnnotationAdd],
+      [effectiveEditable, tool, color, lineWidth, screenToVideo, onAnnotationAdd],
     );
 
     const handleMouseMove = useCallback(
       (e: React.MouseEvent<HTMLCanvasElement>) => {
-        if (!editable || !drawingRef.current) return;
+        if (!effectiveEditable || !drawingRef.current) return;
         const pos = screenToVideo(e.clientX, e.clientY);
 
         switch (tool) {
@@ -252,11 +264,11 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCanvasProp
         }
         redrawRef.current();
       },
-      [editable, tool, color, lineWidth, screenToVideo],
+      [effectiveEditable, tool, color, lineWidth, screenToVideo],
     );
 
     const handleMouseUp = useCallback(() => {
-      if (!editable || !drawingRef.current) return;
+      if (!effectiveEditable || !drawingRef.current) return;
       drawingRef.current = false;
 
       const temp = tempAnnotationRef.current;
@@ -269,7 +281,7 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCanvasProp
       tempAnnotationRef.current = null;
       currentPointsRef.current = [];
       redrawRef.current();
-    }, [editable, onAnnotationAdd]);
+    }, [effectiveEditable, onAnnotationAdd]);
 
     const addAnnotationLocal = useCallback((ann: Annotation) => {
       if (externalAnnotations) return;
@@ -314,6 +326,7 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCanvasProp
           setLocalAnnotations(anns);
         }
       },
+      getCanvas: () => canvasRef.current,
     }), [handleUndo, handleClear, annotations, externalAnnotations]);
 
     return (
@@ -322,7 +335,7 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCanvasProp
           ref={canvasRef}
           className={cn(
             "absolute inset-0",
-            editable ? "cursor-crosshair" : "pointer-events-none",
+            effectiveEditable ? "cursor-crosshair" : "pointer-events-none",
           )}
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
@@ -330,7 +343,7 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCanvasProp
           onMouseLeave={handleMouseUp}
         />
 
-        {editable && (
+        {effectiveEditable && (
           <div className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-xl border border-ink-700/50 bg-ink-950/90 p-1.5 shadow-lg backdrop-blur-sm">
             {TOOLS.map(({ type, icon: Icon, label }) => (
               <button

@@ -1,5 +1,6 @@
 /**
- * WebRTC helpers — codec preference, stats parsing, connection state labels.
+ * WebRTC helpers — codec preference, stats parsing, connection state labels,
+ * adaptive bitrate control.
  * Pure functions shared by the Sender and Receiver work benches.
  */
 
@@ -10,6 +11,21 @@ export const ICE_SERVERS: RTCIceServer[] = [
 
 /** Preferred video codec names — VP8 first (royalty-free, well supported), H.264 fallback. */
 const PREFERRED_CODEC_NAMES = ["VP8", "H264"]
+
+export interface QualityPreset {
+  label: string
+  width: number
+  height: number
+  maxFps: number
+  maxBitrateKbps: number
+}
+
+export const QUALITY_PRESETS: QualityPreset[] = [
+  { label: "LOW", width: 640, height: 360, maxFps: 15, maxBitrateKbps: 400 },
+  { label: "MEDIUM", width: 960, height: 540, maxFps: 24, maxBitrateKbps: 1200 },
+  { label: "HIGH", width: 1280, height: 720, maxFps: 30, maxBitrateKbps: 2500 },
+  { label: "FULL", width: 1920, height: 1080, maxFps: 30, maxBitrateKbps: 5000 },
+]
 
 function getVideoCodecs() {
   if (typeof RTCRtpReceiver === "undefined") return [] as { mimeType: string }[]
@@ -66,6 +82,63 @@ export function createPeerConnection(): RTCPeerConnection {
   return new RTCPeerConnection({ iceServers: ICE_SERVERS })
 }
 
+/**
+ * Estimate bandwidth quality from the latest stats.
+ * Returns a quality level index (0..QUALITY_PRESETS.length - 1).
+ * Heuristic:
+ *  - Heavy packet loss (> 5%) → drop
+ *  - High jitter (> 80ms) → drop
+ *  - Bitrate well below preset → drop
+ *  - Stable high bitrate with low loss → upgrade
+ */
+export function estimateQualityIndex(
+  stats: LinkStats,
+  currentIndex: number,
+): number {
+  const lossPct = stats.fps > 0 ? (stats.packetsLost / Math.max(1, stats.packetsLost + 100)) * 100 : 0
+  const desired = QUALITY_PRESETS[currentIndex]
+  const bitrateOk = stats.bitrateKbps >= desired.maxBitrateKbps * 0.7
+  const stable = lossPct < 3 && stats.jitterMs < 60 && stats.fps >= desired.maxFps * 0.7
+  const degraded = lossPct > 5 || stats.jitterMs > 80 || stats.bitrateKbps < desired.maxBitrateKbps * 0.3
+
+  if (degraded && currentIndex > 0) return currentIndex - 1
+  if (stable && bitrateOk && currentIndex < QUALITY_PRESETS.length - 1) return currentIndex + 1
+  return currentIndex
+}
+
+/**
+ * Apply a quality preset to an outbound video sender via RTCRtpSender.setParameters
+ * (encodings maxBitrate + scaleResolutionDownBy) plus MediaStreamTrack constraints
+ * when available.
+ */
+export async function applyQualityPreset(
+  sender: RTCRtpSender,
+  preset: QualityPreset,
+): Promise<void> {
+  try {
+    const params = sender.getParameters()
+    if (params.encodings && params.encodings.length > 0) {
+      params.encodings[0].maxBitrate = preset.maxBitrateKbps * 1000
+      params.encodings[0].maxFramerate = preset.maxFps
+    }
+    await sender.setParameters(params)
+  } catch {
+    /* best effort — ignore */
+  }
+  try {
+    const track = sender.track
+    if (track && "applyConstraints" in track) {
+      await (track as MediaStreamTrack).applyConstraints({
+        width: { ideal: preset.width },
+        height: { ideal: preset.height },
+        frameRate: { ideal: preset.maxFps },
+      } as MediaTrackConstraints)
+    }
+  } catch {
+    /* best effort — ignore */
+  }
+}
+
 export interface LinkStats {
   bitrateKbps: number
   width: number
@@ -104,10 +177,24 @@ export async function readLinkStats(
   let candidateType = "—"
   let codec = "—"
 
-  for (const r of report.values() as IterableIterator<any>) {
+  interface StatsEntry {
+    type: string;
+    mimeType?: string;
+    localCandidateId?: string;
+    candidateType?: string;
+    nominated?: boolean;
+    bytesSent?: number;
+    bytesReceived?: number;
+    frameWidth?: number;
+    frameHeight?: number;
+    framesPerSecond?: number;
+    packetsLost?: number;
+    jitter?: number;
+  }
+  for (const r of report.values() as IterableIterator<StatsEntry>) {
     if (r.type === "candidate-pair" && r.nominated) {
-      const local = report.get(r.localCandidateId) as any
-      if (local) candidateType = local.candidateType ?? "—"
+      const local = r.localCandidateId ? report.get(r.localCandidateId) : undefined
+      if (local) candidateType = (local as StatsEntry).candidateType ?? "—"
     }
     if (r.type === "codec") {
       codec = (r.mimeType ?? "").replace("video/", "") || codec

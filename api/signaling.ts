@@ -2,13 +2,22 @@
  * WebRTC signaling server — room management + SDP/ICE relay over WebSocket.
  *
  * The server never touches media: it only maintains room membership and
- * forwards offer/answer/candidate messages between the two peers. Once the
- * SDP + ICE exchange completes, the browser pair has a direct P2P link.
+ * forwards offer/answer/candidate messages between peers. Once the SDP + ICE
+ * exchange completes, the browser pair has a direct P2P link.
+ *
+ * Features:
+ *  - 1 sender (A端) + N receivers (B端) per room, dynamically joinable.
+ *  - Annotation permission mode: host-only (default) or free, with per-client
+ *    authorization list maintained by the host (sender).
  */
 import { WebSocketServer, WebSocket } from 'ws'
 import type { Server } from 'http'
 import { randomUUID } from 'crypto'
-import type { SignalMessage } from '@shared/signal'
+import type {
+  SignalMessage,
+  AnnotationMode,
+  RoomMember,
+} from '@shared/signal'
 
 interface ClientInfo {
   id: string
@@ -17,11 +26,18 @@ interface ClientInfo {
   role: 'sender' | 'receiver' | null
 }
 
+interface RoomState {
+  id: string
+  members: Map<string, ClientInfo>
+  senderId: string | null
+  annotationMode: AnnotationMode
+  authorizedAnnotators: Set<string>
+}
+
 const clients = new Map<string, ClientInfo>()
-const rooms = new Map<string, Map<string, ClientInfo>>()
+const rooms = new Map<string, RoomState>()
 
 const ROOM_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-const MAX_ROOM_MEMBERS = 2
 
 function generateRoomId(): string {
   for (let attempt = 0; attempt < 16; attempt++) {
@@ -40,18 +56,28 @@ function send(ws: WebSocket, msg: SignalMessage): void {
   }
 }
 
+function getRoomMembers(room: RoomState): RoomMember[] {
+  return Array.from(room.members.values()).map((c) => ({
+    clientId: c.id,
+    role: c.role ?? 'receiver',
+  }))
+}
+
 function broadcastRoomState(roomId: string): void {
   const room = rooms.get(roomId)
   if (!room) return
-  const members = Array.from(room.values()).map((c) => ({
-    clientId: c.id,
-    role: c.role,
-  }))
-  for (const client of room.values()) {
+  const payload = {
+    roomId,
+    members: getRoomMembers(room),
+    annotationMode: room.annotationMode,
+    authorizedAnnotators: Array.from(room.authorizedAnnotators),
+    senderId: room.senderId,
+  }
+  for (const client of room.members.values()) {
     send(client.ws, {
       type: 'state',
       room: roomId,
-      payload: { roomId, members },
+      payload: payload as unknown as Record<string, unknown>,
     })
   }
 }
@@ -60,9 +86,19 @@ function forwardToOthers(sender: ClientInfo, msg: SignalMessage): void {
   if (!sender.roomId) return
   const room = rooms.get(sender.roomId)
   if (!room) return
-  for (const client of room.values()) {
+  for (const client of room.members.values()) {
     if (client.id === sender.id) continue
     send(client.ws, { ...msg, from: sender.id })
+  }
+}
+
+function forwardToPeer(sender: ClientInfo, msg: SignalMessage, targetId: string): void {
+  if (!sender.roomId) return
+  const room = rooms.get(sender.roomId)
+  if (!room) return
+  const target = room.members.get(targetId)
+  if (target) {
+    send(target.ws, { ...msg, from: sender.id })
   }
 }
 
@@ -74,34 +110,50 @@ function removeClient(client: ClientInfo): void {
   if (!roomId) return
   const room = rooms.get(roomId)
   if (!room) return
-  room.delete(client.id)
-  for (const other of room.values()) {
+  room.members.delete(client.id)
+  room.authorizedAnnotators.delete(client.id)
+  if (room.senderId === client.id) {
+    room.senderId = null
+  }
+  for (const other of room.members.values()) {
     send(other.ws, {
       type: 'peer-left',
       room: roomId,
-      payload: { peerId: client.id },
+      payload: { peerId: client.id } as unknown as Record<string, unknown>,
     })
   }
-  if (room.size === 0) {
+  if (room.members.size === 0) {
     rooms.delete(roomId)
   } else {
     broadcastRoomState(roomId)
   }
 }
 
+function isSender(client: ClientInfo): boolean {
+  if (!client.roomId) return false
+  const room = rooms.get(client.roomId)
+  return !!room && room.senderId === client.id
+}
+
 function handleMessage(client: ClientInfo, msg: SignalMessage): void {
   switch (msg.type) {
     case 'create-room': {
       const roomId = generateRoomId()
-      const room = new Map<string, ClientInfo>()
-      room.set(client.id, client)
+      const room: RoomState = {
+        id: roomId,
+        members: new Map(),
+        senderId: client.id,
+        annotationMode: 'host',
+        authorizedAnnotators: new Set([client.id]),
+      }
+      room.members.set(client.id, client)
       rooms.set(roomId, room)
       client.roomId = roomId
       client.role = 'sender'
       send(client.ws, {
         type: 'room-created',
         room: roomId,
-        payload: { roomId, clientId: client.id },
+        payload: { roomId, clientId: client.id } as unknown as Record<string, unknown>,
       })
       broadcastRoomState(roomId)
       break
@@ -113,33 +165,34 @@ function handleMessage(client: ClientInfo, msg: SignalMessage): void {
       if (!room) {
         return send(client.ws, {
           type: 'error',
-          payload: { message: `房间不存在: ${roomId || '—'}` },
+          payload: { message: `房间不存在: ${roomId || '—'}` } as unknown as Record<string, unknown>,
         })
       }
-      if (room.size >= MAX_ROOM_MEMBERS) {
-        return send(client.ws, {
-          type: 'error',
-          payload: { message: '房间已满 (A↔B 一对一)' },
-        })
-      }
-      room.set(client.id, client)
+      room.members.set(client.id, client)
       client.roomId = roomId
       client.role = 'receiver'
-      const peers = Array.from(room.values())
+      const peers = Array.from(room.members.values())
         .filter((c) => c.id !== client.id)
         .map((c) => c.id)
       send(client.ws, {
         type: 'joined',
         room: roomId,
-        payload: { roomId, clientId: client.id, peers },
+        payload: {
+          roomId,
+          clientId: client.id,
+          peers,
+        } as unknown as Record<string, unknown>,
       })
-      for (const other of room.values()) {
+      for (const other of room.members.values()) {
         if (other.id === client.id) continue
         send(other.ws, {
           type: 'peer-joined',
           room: roomId,
           from: client.id,
-          payload: { peerId: client.id, role: 'receiver' },
+          payload: {
+            peerId: client.id,
+            role: 'receiver',
+          } as unknown as Record<string, unknown>,
         })
       }
       broadcastRoomState(roomId)
@@ -151,10 +204,98 @@ function handleMessage(client: ClientInfo, msg: SignalMessage): void {
       if (!client.roomId) {
         return send(client.ws, {
           type: 'error',
-          payload: { message: '尚未加入房间' },
+          payload: { message: '尚未加入房间' } as unknown as Record<string, unknown>,
         })
       }
-      forwardToOthers(client, msg)
+      if (msg.to) {
+        forwardToPeer(client, msg, msg.to)
+      } else {
+        forwardToOthers(client, msg)
+      }
+      break
+    }
+    case 'set-annotation-mode': {
+      if (!client.roomId || !isSender(client)) {
+        return send(client.ws, {
+          type: 'error',
+          payload: { message: '只有主持人可修改标注模式' } as unknown as Record<string, unknown>,
+        })
+      }
+      const room = rooms.get(client.roomId)!
+      const mode = (msg.payload?.mode as AnnotationMode) ?? 'host'
+      room.annotationMode = mode
+      if (mode === 'free') {
+        for (const m of room.members.values()) {
+          room.authorizedAnnotators.add(m.id)
+        }
+      } else {
+        room.authorizedAnnotators.clear()
+        if (room.senderId) room.authorizedAnnotators.add(room.senderId)
+      }
+      for (const other of room.members.values()) {
+        send(other.ws, {
+          type: 'annotation-mode-changed',
+          room: room.id,
+          payload: { mode } as unknown as Record<string, unknown>,
+        })
+      }
+      broadcastRoomState(room.id)
+      break
+    }
+    case 'authorize-annotator': {
+      if (!client.roomId || !isSender(client)) {
+        return send(client.ws, {
+          type: 'error',
+          payload: { message: '只有主持人可授权标注' } as unknown as Record<string, unknown>,
+        })
+      }
+      const room = rooms.get(client.roomId)!
+      const targetId = msg.payload?.clientId as string
+      if (!targetId || !room.members.has(targetId)) {
+        return send(client.ws, {
+          type: 'error',
+          payload: { message: '授权目标不存在' } as unknown as Record<string, unknown>,
+        })
+      }
+      room.authorizedAnnotators.add(targetId)
+      for (const other of room.members.values()) {
+        send(other.ws, {
+          type: 'annotators-changed',
+          room: room.id,
+          payload: {
+            authorizedAnnotators: Array.from(room.authorizedAnnotators),
+          } as unknown as Record<string, unknown>,
+        })
+      }
+      broadcastRoomState(room.id)
+      break
+    }
+    case 'revoke-annotator': {
+      if (!client.roomId || !isSender(client)) {
+        return send(client.ws, {
+          type: 'error',
+          payload: { message: '只有主持人可撤销标注权限' } as unknown as Record<string, unknown>,
+        })
+      }
+      const room = rooms.get(client.roomId)!
+      const targetId = msg.payload?.clientId as string
+      if (!targetId || targetId === room.senderId) {
+        return send(client.ws, {
+          type: 'error',
+          payload: { message: '无法撤销主持人的标注权限' } as unknown as Record<string, unknown>,
+        })
+      }
+      room.authorizedAnnotators.delete(targetId)
+      for (const other of room.members.values()) {
+        send(other.ws, {
+          type: 'annotators-changed',
+          room: room.id,
+          payload: {
+            authorizedAnnotators: Array.from(room.authorizedAnnotators),
+          } as unknown as Record<string, unknown>,
+        })
+      }
+      broadcastRoomState(room.id)
       break
     }
     case 'leave': {
@@ -164,7 +305,7 @@ function handleMessage(client: ClientInfo, msg: SignalMessage): void {
     default:
       send(client.ws, {
         type: 'error',
-        payload: { message: `未知消息类型: ${msg.type}` },
+        payload: { message: `未知消息类型: ${msg.type}` } as unknown as Record<string, unknown>,
       })
   }
 }
@@ -175,7 +316,10 @@ export function setupSignaling(server: Server): WebSocketServer {
   wss.on('connection', (ws) => {
     const client: ClientInfo = { id: randomUUID(), ws, roomId: null, role: null }
     clients.set(client.id, client)
-    send(ws, { type: 'connected', payload: { clientId: client.id } })
+    send(ws, {
+      type: 'connected',
+      payload: { clientId: client.id } as unknown as Record<string, unknown>,
+    })
 
     ws.on('message', (raw) => {
       let msg: SignalMessage
@@ -184,7 +328,7 @@ export function setupSignaling(server: Server): WebSocketServer {
       } catch {
         return send(ws, {
           type: 'error',
-          payload: { message: '无效的 JSON 消息' },
+          payload: { message: '无效的 JSON 消息' } as unknown as Record<string, unknown>,
         })
       }
       handleMessage(client, msg)
